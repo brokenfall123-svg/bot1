@@ -16,31 +16,39 @@ from aiogram.enums import ContentType
 
 # ================== НАСТРОЙКИ ==================
 
+# ⚠️ В проде лучше хранить в переменных окружения
 TELEGRAM_BOT_TOKEN = "8559514946:AAFwULZem2V-0Rab7DIhAyHAjK8MhyFSsvM"
 APIFREE_API_KEY = "sk-pjGGTiMzewfM4iiRCkfEwbXWPQ166"
 
-# Модели на Apifree
-SEEDREAM_MODEL_NAME = "bytedance/seedream-4.5"          # генерация с нуля[page:1]
-GPT_IMAGE_EDIT_MODEL = "openai/gpt-image-1/edit"        # редактирование картинки[page:1]
+APIFREE_BASE_URL = "https://api.apifree.ai"  # из доки Seedream[web:98]
 
-APIFREE_IMAGE_URL = "https://api.apifree.ai/v1/images/generations"  # OpenAI-совместимый images API[page:1][web:59]
+# Модели
+SEEDREAM_MODEL_NAME = "bytedance/seedream-4.5"      # генерация с нуля[web:98]
+GPT_IMAGE_EDIT_MODEL = "openai/gpt-image-1/edit"    # редактирование изображения[page:1]
 
-# ================== ИНИЦИАЛИЗАЦИЯ ==================
+# Для GPT-Image-1-Edit используем OpenAI‑совместимый images endpoint
+APIFREE_IMAGE_URL = "https://api.apifree.ai/v1/images/generations"  # общий image API[web:59]
+
+# ================== ИНИЦИАЛИЗАЦИЯ БОТА ==================
 
 bot = Bot(TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 
 # Состояния пользователей:
-# img  – ожидаем текстовый промт для генерации с нуля
-# lora_image_uploaded – PNG загружен, ждём промт для редактирования
+# "img"                — ждём промт для генерации с нуля
+# "lora_wait_image"    — ждём PNG для редактирования
+# "lora_image_uploaded"— PNG есть, ждём промт
 user_state: dict[int, str | None] = {}
-# Хранилище загруженных изображений для lora: user_id -> file_id
+# запомним PNG для lora: user_id -> file_id
 user_lora_image: dict[int, str] = {}
 
 
 # ================== КЛАВИАТУРА ==================
 
 def main_keyboard() -> InlineKeyboardMarkup:
+    """
+    Inline-клавиатура с двумя кнопками: хочу img / хочу lora.
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -55,6 +63,9 @@ def main_keyboard() -> InlineKeyboardMarkup:
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
+    """
+    Стартовое сообщение: показываем кнопки.
+    """
     await message.answer(
         "Привет! Выбери, что хочешь сделать:",
         reply_markup=main_keyboard(),
@@ -66,7 +77,7 @@ async def cmd_start(message: Message):
 @dp.callback_query(F.data == "want_img")
 async def on_want_img(callback: CallbackQuery):
     """
-    Режим генерации с нуля (Seedream 4.5).
+    Режим генерации с нуля через Seedream 4.5.
     """
     user_id = callback.from_user.id
     user_state[user_id] = "img"
@@ -74,38 +85,46 @@ async def on_want_img(callback: CallbackQuery):
     await callback.answer()
 
 
-# ================== КНОПКА: ХОЧУ LORA (EDIT) ==================
+# ================== КНОПКА: ХОЧУ LORA ==================
 
 @dp.callback_query(F.data == "want_lora")
 async def on_want_lora(callback: CallbackQuery):
     """
-    Режим редактирования изображения (GPT-Image-1-Edit).
-    Сначала просим PNG как документ, потом промт.
+    Режим редактирования изображения (GPT-Image-1-Edit):
+    1) сначала юзер присылает PNG как документ,
+    2) затем пишет промт, что нужно изменить.
     """
     user_id = callback.from_user.id
     user_state[user_id] = "lora_wait_image"
     user_lora_image.pop(user_id, None)
+
     await callback.message.answer(
         "Отправь PNG‑файл (как документ, не как фото), который нужно изменить."
     )
     await callback.answer()
 
 
-# ================== ТЕКСТ: ПРОМТЫ ==================
+# ================== ОБРАБОТКА ТЕКСТА ==================
 
 @dp.message(F.text)
 async def handle_text(message: Message):
+    """
+    Обработка текстовых сообщений:
+    - если режим 'img': это промт для Seedream 4.5
+    - если 'lora_image_uploaded': это промт для редактирования GPT-Image-1-Edit
+    - иначе просим выбрать режим.
+    """
     user_id = message.from_user.id
     mode = user_state.get(user_id)
     text = message.text.strip()
 
-    # ---- режим генерации с нуля (img) ----
+    # ---------- РЕЖИМ ГЕНЕРАЦИИ С НУЛЯ (IMG) ----------
     if mode == "img":
         if not text:
             await message.answer("Промт пустой. Напиши, что нужно сгенерировать.")
             return
 
-        await message.answer("Генерирую изображение, подожди немного...")
+        await message.answer("Генерирую изображение (Seedream 4.5), подожди немного...")
 
         try:
             image_bytes = await generate_image_with_seedream(text)
@@ -122,7 +141,7 @@ async def handle_text(message: Message):
         user_state[user_id] = None
         return
 
-    # ---- режим редактирования (lora_image_uploaded) ----
+    # ---------- РЕЖИМ РЕДАКТИРОВАНИЯ (LORA: PNG УЖЕ ЗАГРУЖЕН) ----------
     if mode == "lora_image_uploaded":
         if not text:
             await message.answer("Промт пустой. Опиши, как нужно изменить изображение.")
@@ -137,9 +156,9 @@ async def handle_text(message: Message):
             user_state[user_id] = None
             return
 
-        await message.answer("Редактирую изображение, подожди немного...")
+        await message.answer("Редактирую изображение (GPT‑Image‑1‑Edit), подожди немного...")
 
-        # скачиваем PNG с серверов Telegram
+        # 1) скачиваем PNG с серверов Telegram
         try:
             image_bytes = await download_file_bytes(file_id)
         except Exception as e:
@@ -150,7 +169,7 @@ async def handle_text(message: Message):
             await message.answer("Не удалось получить байты изображения.")
             return
 
-        # отправляем в GPT-Image-1-Edit
+        # 2) шлём в GPT-Image-1-Edit
         try:
             edited_bytes = await edit_image_with_gpt_image_1(image_bytes, text)
         except Exception as e:
@@ -163,24 +182,23 @@ async def handle_text(message: Message):
             file = FSInputFile(io.BytesIO(edited_bytes), filename="edited.png")
             await message.answer_photo(photo=file, caption="Вот отредактированное изображение ✅")
 
-        # сбрасываем состояние
         user_state[user_id] = None
         user_lora_image.pop(user_id, None)
         return
 
-    # ---- если режим не выбран ----
+    # ---------- РЕЖИМ НЕ ВЫБРАН ----------
     await message.answer(
         "Сначала выбери режим через кнопки:",
         reply_markup=main_keyboard(),
     )
 
 
-# ================== ПРИЁМ PNG ДЛЯ LORA (EDIT) ==================
+# ================== ПРИЁМ PNG ДЛЯ LORA ==================
 
 @dp.message(F.content_type == ContentType.DOCUMENT)
 async def handle_document(message: Message):
     """
-    Принимаем только PNG-документы для режима lora.
+    Принимаем PNG-документы в режиме lora.
     """
     user_id = message.from_user.id
     mode = user_state.get(user_id)
@@ -197,7 +215,7 @@ async def handle_document(message: Message):
         await message.answer("Нужен файл в формате PNG. Отправь .png документом.")
         return
 
-    # сохраняем file_id в память и просим промт
+    # сохраняем file_id и просим промт
     user_lora_image[user_id] = doc.file_id
     user_state[user_id] = "lora_image_uploaded"
 
@@ -207,7 +225,7 @@ async def handle_document(message: Message):
 @dp.message(F.content_type == ContentType.PHOTO)
 async def handle_photo(message: Message):
     """
-    Если прислали фото вместо документа — подсказываем, как нужно.
+    Если юзер прислал фото вместо документа.
     """
     user_id = message.from_user.id
     mode = user_state.get(user_id)
@@ -230,59 +248,93 @@ async def download_file_bytes(file_id: str) -> bytes | None:
     Скачиваем файл из Telegram по file_id и возвращаем байты.
     """
     file = await bot.get_file(file_id)
-    file_path = file.file_path
-    return await bot.download_file(file_path)
+    return await bot.download_file(file.file_path)
 
 
 async def generate_image_with_seedream(prompt: str) -> bytes | None:
     """
-    Вызов Seedream 4.5 через Apifree (генерация с нуля, как раньше).[page:1][web:59]
-    """
-    payload = {
-        "model": SEEDREAM_MODEL_NAME,
-        "prompt": prompt,
-        "size": "1024x1024",
-        "response_format": "b64_json",
-    }
+    Seedream 4.5 через Apifree: асинхронный двухшаговый API.[web:98]
 
+    1) POST /v1/image/submit -> request_id
+    2) GET  /v1/image/{request_id}/result -> status + image_list[0]
+    3) Скачиваем картинку по URL.
+    """
     headers = {
         "Authorization": f"Bearer {APIFREE_API_KEY}",
         "Content-Type": "application/json",
     }
 
+    submit_payload = {
+        "model": SEEDREAM_MODEL_NAME,
+        "prompt": prompt,
+        "seed": 8899,     # опционально
+        "size": "2K",     # или "4K"[web:98]
+    }
+
     async with aiohttp.ClientSession() as session:
-        async with session.post(APIFREE_IMAGE_URL, headers=headers, json=payload) as resp:
+        # 1. Submit
+        submit_url = f"{APIFREE_BASE_URL}/v1/image/submit"
+        async with session.post(submit_url, headers=headers, json=submit_payload) as resp:
             if resp.status != 200:
                 text = await resp.text()
-                raise RuntimeError(f"Seedream HTTP {resp.status}: {text}")
+                raise RuntimeError(f"Submission failed HTTP {resp.status}: {text}")
 
             data = await resp.json()
 
-    if "data" not in data or not data["data"]:
-        return None
+        if data.get("code") != 200:
+            raise RuntimeError(f"API Error: {data.get('code_msg') or data.get('error')}")
 
-    b64_img = data["data"][0].get("b64_json")
-    if not b64_img:
-        return None
+        request_id = data["resp_data"]["request_id"]
 
-    return base64.b64decode(b64_img)
+        # 2. Poll for result
+        result_url = f"{APIFREE_BASE_URL}/v1/image/{request_id}/result"
+
+        while True:
+            await asyncio.sleep(2)  # как в примере из доки[web:98]
+
+            async with session.get(result_url, headers=headers) as check_resp:
+                check_data = await check_resp.json()
+
+            if check_data.get("code") != 200:
+                raise RuntimeError(f"Check failed: {check_data.get('code_msg')}")
+
+            status = check_data["resp_data"]["status"]
+
+            if status == "success":
+                image_list = check_data["resp_data"].get("image_list") or []
+                if not image_list:
+                    return None
+
+                img_url = image_list[0]
+
+                # 3. Скачиваем изображение по URL
+                async with session.get(img_url) as img_resp:
+                    if img_resp.status != 200:
+                        raise RuntimeError(
+                            f"Image download failed HTTP {img_resp.status}: {await img_resp.text()}"
+                        )
+                    return await img_resp.read()
+
+            if status in ("error", "failed"):
+                raise RuntimeError(
+                    f"Task failed: {check_data['resp_data'].get('error')}"
+                )
+
+            # status: queuing / processing — продолжаем ждать
 
 
 async def edit_image_with_gpt_image_1(image_bytes: bytes, prompt: str) -> bytes | None:
     """
-    Вызов GPT-Image-1-Edit через Apifree.[page:1]
+    Редактирование изображения через GPT-Image-1-Edit на Apifree.[page:1][web:59]
 
-    По документации модель gpt-image-1-edit работает через edits endpoint, но
-    на Apifree она представлена через общий OpenAI-совместимый images API:[web:59][page:1]
-
-    Тело запроса (типичный формат):
+    Формат (OpenAI‑совместимый images API):
     {
       "model": "openai/gpt-image-1/edit",
-      "prompt": "сделай пиксель-арт",
+      "prompt": "...",
       "image": "<base64 PNG>",
       "size": "1024x1024",
-      "response_format": "b64_json",
-      "quality": "high"
+      "quality": "high",
+      "response_format": "b64_json"
     }
     """
     b64_image = base64.b64encode(image_bytes).decode("utf-8")
