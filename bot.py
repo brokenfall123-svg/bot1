@@ -199,4 +199,141 @@ async def handle_document(message: Message):
 @dp.message(F.content_type == ContentType.PHOTO)
 async def handle_photo(message: Message):
     user_id = message.from_user.id
-    mode = user_state.get(user
+    mode = user_state.get(user_id)
+
+    if mode in ("lora_wait_image", "lora_image_uploaded"):
+        await message.answer(
+            "Пожалуйста, пришли PNG именно как *документ*, а не как фото."
+        )
+    else:
+        await message.answer(
+            "Чтобы загрузить файл для lora-редактирования, сначала нажми кнопку \"хочу lora\".",
+            reply_markup=main_keyboard(),
+        )
+
+
+# ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
+
+async def download_file_bytes(file_id: str) -> bytes | None:
+    file = await bot.get_file(file_id)
+    return await bot.download_file(file.file_path)
+
+
+async def generate_image_with_seedream(prompt: str) -> bytes | None:
+    """
+    Seedream 4.5 через Apifree (асинхронный submit/result).[web:98]
+    """
+    headers = {
+        "Authorization": f"Bearer {APIFREE_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    submit_payload = {
+        "model": SEEDREAM_MODEL_NAME,
+        "prompt": prompt,
+        "seed": 8899,
+        "size": "2K",
+    }
+
+    async with aiohttp.ClientSession() as session:
+        # 1. Submit
+        submit_url = f"{APIFREE_BASE_URL}/v1/image/submit"
+        async with session.post(submit_url, headers=headers, json=submit_payload) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"Submission failed HTTP {resp.status}: {text}")
+
+            data = await resp.json()
+
+        if data.get("code") != 200:
+            raise RuntimeError(f"API Error: {data.get('code_msg') or data.get('error')}")
+
+        request_id = data["resp_data"]["request_id"]
+
+        # 2. Poll result
+        result_url = f"{APIFREE_BASE_URL}/v1/image/{request_id}/result"
+        max_checks = 30  # ~60 секунд при шаге 2 сек
+        checks = 0
+
+        while True:
+            checks += 1
+            if checks > max_checks:
+                raise RuntimeError("Timeout ожидания результата от Seedream 4.5")
+
+            await asyncio.sleep(2)
+
+            async with session.get(result_url, headers=headers) as check_resp:
+                check_data = await check_resp.json()
+
+            if check_data.get("code") != 200:
+                raise RuntimeError(f"Check failed: {check_data.get('code_msg')}")
+
+            status = check_data["resp_data"]["status"]
+
+            if status == "success":
+                image_list = check_data["resp_data"].get("image_list") or []
+                if not image_list:
+                    return None
+
+                img_url = image_list[0]
+
+                async with session.get(img_url) as img_resp:
+                    if img_resp.status != 200:
+                        raise RuntimeError(
+                            f"Image download failed HTTP {img_resp.status}: {await img_resp.text()}"
+                        )
+                    return await img_resp.read()
+
+            if status in ("error", "failed"):
+                raise RuntimeError(
+                    f"Task failed: {check_data['resp_data'].get('error')}"
+                )
+            # иначе status: queuing / processing — продолжаем ждать
+
+
+async def edit_image_with_gpt_image_1(image_bytes: bytes, prompt: str) -> bytes | None:
+    """
+    GPT-Image-1-Edit через OpenAI‑совместимый endpoint.[page:1][web:59]
+    """
+    b64_image = base64.b64encode(image_bytes).decode("utf-8")
+
+    payload = {
+        "model": GPT_IMAGE_EDIT_MODEL,
+        "prompt": prompt,
+        "image": b64_image,
+        "size": "1024x1024",
+        "quality": "high",
+        "response_format": "b64_json",
+    }
+
+    headers = {
+        "Authorization": f"Bearer {APIFREE_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(APIFREE_IMAGE_URL, headers=headers, json=payload) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"GPT-Image-1-Edit HTTP {resp.status}: {text}")
+
+            data = await resp.json()
+
+    if "data" not in data or not data["data"]:
+        return None
+
+    b64_img = data["data"][0].get("b64_json")
+    if not b64_img:
+        return None
+
+    return base64.b64decode(b64_img)
+
+
+# ================== ЗАПУСК ==================
+
+async def main():
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
